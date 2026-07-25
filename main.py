@@ -30,7 +30,7 @@ class ToolCall(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# read_file  (unchanged - this part passed)
+# read_file
 # ---------------------------------------------------------------------------
 
 def safe_read_file(path: str):
@@ -61,7 +61,7 @@ def safe_read_file(path: str):
 
 
 # ---------------------------------------------------------------------------
-# fetch_url - hardened with IP pinning to eliminate DNS-rebinding/TOCTOU
+# fetch_url
 # ---------------------------------------------------------------------------
 
 def normalize_host(host: str) -> str:
@@ -72,8 +72,6 @@ def normalize_host(host: str) -> str:
 
 
 def resolve_public_ip(host: str) -> Optional[str]:
-    """Resolve host and return ONE validated public IP string, or None if
-    unresolvable or every resolved address is private/reserved."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -94,40 +92,45 @@ def resolve_public_ip(host: str) -> Optional[str]:
             or ip.is_unspecified
         ):
             continue
-        return ip_str  # first good public IP
+        return ip_str
     return None
 
 
 def validate_and_pin(url: str):
-    """Returns (ok, reason, host, pinned_ip, scheme, port) for a URL."""
+    """Returns (ok, reason, host, pinned_ip, scheme, port) for a URL.
+    Any parsing failure anywhere in this function results in a block,
+    never an unhandled exception."""
     try:
         parsed = urlparse(url)
-    except Exception:
-        return False, "Could not parse URL.", None, None, None, None
 
-    scheme = (parsed.scheme or "").lower()
-    if scheme not in ("http", "https"):
-        return False, "Only http/https URLs are allowed.", None, None, None, None
+        scheme = (parsed.scheme or "").lower()
+        if scheme not in ("http", "https"):
+            return False, "Only http/https URLs are allowed.", None, None, None, None
 
-    if parsed.username or parsed.password:
-        return False, "URLs with embedded userinfo are not allowed.", None, None, None, None
+        if parsed.username or parsed.password:
+            return False, "URLs with embedded userinfo are not allowed.", None, None, None, None
 
-    raw_host = parsed.hostname
-    if not raw_host:
-        return False, "URL has no valid host.", None, None, None, None
+        raw_host = parsed.hostname
+        if not raw_host:
+            return False, "URL has no valid host.", None, None, None, None
 
-    host = normalize_host(raw_host)
+        host = normalize_host(raw_host)
 
-    if host not in ALLOWED_HOSTS:
-        return False, f"Host '{host}' is not on the exact allowlist.", None, None, None, None
+        if host not in ALLOWED_HOSTS:
+            return False, f"Host '{host}' is not on the exact allowlist.", None, None, None, None
 
-    pinned_ip = resolve_public_ip(host)
-    if pinned_ip is None:
-        return False, "Host does not resolve to any public IP address.", None, None, None, None
+        port = parsed.port
+        if port is None:
+            port = 443 if scheme == "https" else 80
 
-    port = parsed.port or (443 if scheme == "https" else 80)
+        pinned_ip = resolve_public_ip(host)
+        if pinned_ip is None:
+            return False, "Host does not resolve to any public IP address.", None, None, None, None
 
-    return True, "Host is allowed and resolves to a public address.", host, pinned_ip, scheme, port
+        return True, "Host is allowed and resolves to a public address.", host, pinned_ip, scheme, port
+
+    except Exception as e:
+        return False, f"URL could not be safely parsed: {e}", None, None, None, None
 
 
 def safe_fetch_url(url: str):
@@ -142,13 +145,8 @@ def safe_fetch_url(url: str):
         if not ok:
             return "block", reason, None
 
-        # Connect directly to the pinned IP so httpx cannot perform its own
-        # DNS resolution (which could differ from what we validated).
-        # We still send the correct Host header / SNI via the URL's host.
         try:
-            transport = httpx.HTTPTransport(local_address=None)
             with httpx.Client(
-                transport=transport,
                 follow_redirects=False,
                 timeout=6.0,
                 headers={"Host": host},
@@ -160,8 +158,6 @@ def safe_fetch_url(url: str):
 
                 pinned_url = f"{scheme}://{pinned_ip}:{port}{path_and_query}"
 
-                # For HTTPS, verify against the real hostname (SNI/cert check)
-                # while still connecting to the pinned IP.
                 if scheme == "https":
                     resp = client.get(
                         pinned_url,
